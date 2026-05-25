@@ -1,0 +1,1148 @@
+---
+title: |
+  ![](https://www.ocwa.com/wp-content/uploads/2023/10/logo.svg){width=1in} |NPRI Wastewater PFAS Calcuator, Reporting Year 2025
+author: "OCWA Process Optimization IPOTS (contact: jho@ocwa.com)" 
+format: 
+  html:
+    theme: lumen
+    toc: true
+    toc-expand: 2
+    number-sections: true
+    code-fold: true
+    other-links:
+    - text: NPRI PFAS Guidance
+      href: https://www.canada.ca/en/environment-climate-change/services/national-pollutant-release-inventory/report/pfas.html/
+    - text: OCWA SPC Reporting Guidance
+      href: //ocwfilecorp/Public/Everyone/PCT/CEPA
+resources:
+  - data
+params:
+  facility: "Belleville Wastewater Treatment Facility"
+--- 
+<!-- Admin Readme -->
+<!-- 2026.05.24 JH -->
+<!-- "pfas-npri-long" uses the available list of plants reporting to NPRI (2024 list from compliance), manually downloaded annual flows and biosolids from WISKI Reporting Services annual performance and biosolids quality reports, respectively.  The collated information is saved in data/PFAS-calculator.xlsx which serves as an intermediary data source during batch report generation. -->
+
+<!-- render.R should be run to generate a parameterized report for each plant -->
+
+<!-- However, in spite there being only ten reporting facilities, biosolids hauled (and TS) values were only found for three, and total annual effluent for nine, rendering incomplete calculations for seven of the ten facilities in 2025.  A warning flag is provided at the head of the reports for the seven facilities with incomplete calculations.  Stratford, Belleville and Lindsay facilities have completed calculations. -->
+
+<!-- Technical questions & supplemental info from T.O., SGS, May 2026 meeting-->
+<!-- 1a. Dry or wet season sampling?  ECCC did Raw influent and effluent 24-hour composite.  Align with ECCC but contrary to EPA recomm. Biosolids grab - "Because some PFAS are known surfactants, the EPA strongly discourages composite sampling for Clean Water Act compliance monitoring. Therefore, samples from sources
+that flow freely (e.g., effluents or in-process waste streams) are collected as grab samples."
+-->
+
+<!-- 2. Not measured = ? -->
+<!-- acid - anion form equivalence? Table 2 of 1633A.   This method measures the analytes as either their anions or neutral forms. The  approach for Clean Water Act uses of the method is to report the analytes in their acid or neutral forms, using the equations in Section 15.2, although the differences between the anion and acid form concentrations are minimal -->
+
+<!-- <!-- 3. < RDL take at RDL or 1/2 RDL --> <!-- For NPRI reporting, the half detection method should be used -->
+
+<!-- In the absence of source-specific information (e.g., historical data) on the levels of PFAS -->
+<!-- or project-specific requirements, collect at least three aliquots of all aqueous samples to -->
+<!-- allow sufficient volume for an original whole-volume analysis, a re-extraction and second -->
+<!-- analysis -->
+
+
+
+```{r, setup}
+#| message: false
+#| warning: false
+#| echo: false
+packages <- c("dplyr", "tidyr", "readr", "readxl", "stringr",  "janitor", "gt", "glue","downloadthis")
+#"viridis","ggplot2", "writexl", "purrr",
+for (p in packages) {
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p)
+    library(p, character.only = TRUE)
+  }
+}
+
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
+APP_CONFIG <- list(
+  data_dir       = "data/rds/",
+  sigfig         = 3, 
+  limit_mld      = 10,
+  threshold_kg   = 1.0,
+  theme_primary  = "#2c3e50",
+  days_per_year  = 365,
+  ml_to_l        = 1e6,
+  m3_to_l        = 1e3, #new To add to Chris
+  kg_to_g        = 1e3,
+  m3_to_kg       = 1e3,
+  ng_to_kg       = 1e-12,
+  zero_tol       = 1e-9   # Tolerance for filtering empty mass rows
+)
+
+options(scipen = 9999)
+
+#Treatment of Not measured and non detects
+#Not measured = NA
+#Below reporting detection limit = taken 1/2 of the value
+below_detection_limit_factor <- 0.5
+```
+
+```{r, helper functions}
+clean_pfas <- \(df) {
+  df <- df |> clean_names()
+  if ("pfas" %in% names(df)) df <- df |> rename(substance_name = pfas)
+  if ("substance" %in% names(df)) df <- df |> rename(substance_name = substance)
+  if ("cas" %in% names(df)) df <- df |> rename(cas_rn = cas)
+  
+  df |> 
+    mutate(
+      across(-any_of(c("substance_name", "cas_rn")), \(val) {
+        val_str <- as.character(val)
+        num_val <- suppressWarnings(parse_number(val_str))
+        if_else(str_starts(val_str, "<"), num_val / 2, num_val) #takes care of 0.5RDL
+      }),
+      across(any_of(c("substance_name", "cas_rn")), \(val) str_trim(as.character(val)))
+    )
+}
+#==================
+fmt_sigfigs <- \(v, sig_figs) {
+  # Vectorized check for NA or 0
+  is_zero_or_na <- is.na(v) | v == 0
+  # Format the numeric values safely
+  formatted <- formatC(signif(v, sig_figs), digits = sig_figs, format = "fg", flag = "#")
+  clean_formatted <- sub("\\.$", "", formatted)
+  # Combine using ifelse
+  ifelse(is_zero_or_na, "0", clean_formatted)
+}
+#=================
+#function to pick out the columns for the treatment type, aggregate and det. reportability
+aggregate_and_report <- function(type_eff, type_bio){ 
+
+  effMass_p<-eff_mass %>% 
+    select(substance_name, cas_rn, all_of(type_eff))  
+  bioMass_p<-bio_mass %>% 
+    select(substance_name, cas_rn, all_of(type_bio)) 
+  
+  # aggMass_p<-
+  #   full_join(effMass_p, bioMass_p,  by = c("cas_rn", "substance_name") ) %>% 
+  #   mutate(aggregate_kg = !!sym(type_eff) + !!sym(type_bio)) %>% 
+  #   select(-!!sym(type_eff), -!!sym(type_bio)) %>% 
+  #   arrange(desc(aggregate_kg)) %>% 
+  #   mutate(reportable = ifelse(aggregate_kg>1, "TRUE", "FALSE"))
+
+  aggMass_p<-
+    full_join(effMass_p, bioMass_p,  by = c("cas_rn", "substance_name") ) %>% 
+    mutate(aggregate_kg = fmt_sigfigs(
+  if_else(
+    is.na(!!sym(type_eff)) & is.na(!!sym(type_bio)), 
+    NA_real_,                                
+    coalesce(!!sym(type_eff), 0) + coalesce(!!sym(type_bio), 0)
+  ), # <-- This closing parenthesis fixes the error!
+  sig_figs = APP_CONFIG$sigfig
+    )) %>%   # Treats individual NAs as 0 and adds them
+    select(-!!sym(type_eff), -!!sym(type_bio)) %>% 
+    arrange(desc(aggregate_kg)) %>% 
+    mutate(reportable = ifelse(aggregate_kg>1, "TRUE", "FALSE"))
+    
+  #Return all three dataframes inside a named list
+  return(list(
+    eff_subset = effMass_p,
+    bio_subset = bioMass_p,
+    agg_report = aggMass_p
+  ))
+}
+```
+
+```{r, import refs}
+#| message: false
+#| warning: false
+#| echo: false
+dt_reportablePFAS<-readRDS("data/rds/Table_1.rds")%>% 
+  dplyr::mutate('NPRI_param' = TRUE) 
+#Chris' import
+dir_path <- APP_CONFIG$data_dir
+bio_spec = read_rds(file.path(dir_path, "Table_8.rds")) |> clean_pfas()
+eff_spec = read_rds(file.path(dir_path, "Table_7.rds")) |> clean_pfas()
+effUS_spec = read_rds(file.path(dir_path, "Table_6.rds")) |> clean_pfas()
+
+#import plants name reference
+dt_facilities <- read_excel(
+  "data/PFAS-calculator.xlsx",
+  sheet = "npri-facilities",
+  trim_ws = TRUE,
+  .name_repair = "minimal"
+) %>% clean_names()%>% 
+  mutate(across(
+    .cols = c(ends_with("value"), ends_with("percent")),
+    .fns = ~ as.numeric(gsub(",", "", .)) # Removes commas before converting
+  )) %>% 
+  mutate(biosolid_kg = if_else(str_detect(biosolid_unit, "m3"), biosolid_value * biosolid_avg_tss_percent*APP_CONFIG$m3_to_kg, biosolid_value)) %>% #to impvrove, assumes kg if not m3
+  mutate(effluent_L = ifelse(effluent_unit== "ML", effluent_value * APP_CONFIG$ml_to_l, effluent_value*APP_CONFIG$m3_to_l))
+
+#extract the "constant" multiplier for liquid and solid
+effluent_L <-
+  dt_facilities |>
+  filter(facility == params$facility) |> 
+  pull(effluent_L)
+
+biosolid_kg <-
+  dt_facilities |>
+  filter(facility == params$facility) |> 
+  pull(biosolid_kg)
+
+if (is.na(biosolid_kg) || is.na(effluent_L)) {
+  flag_completeness <- "incomplete"
+} else {
+  flag_completeness <- "complete"
+}
+```
+```{r, pre-calcs}
+#mass-multiply liquid stream to kg 
+eff_mass <-eff_spec %>%
+  mutate(across(
+    .col = -c(cas_rn, substance_name),
+    .fns = ~. * effluent_L* APP_CONFIG$ng_to_kg
+  ))
+names(eff_mass) <- sub("_ng_l$", "_kg", names(eff_mass))
+  
+bio_mass <- bio_spec %>% 
+  mutate(across(
+    .cols = -c(cas_rn, substance_name),
+    .fns = ~. * biosolid_kg * APP_CONFIG$kg_to_g * APP_CONFIG$ng_to_kg
+  ))
+names(bio_mass) <- sub("_ng_g_dry_weight_basis$", "_kg", names(bio_mass))
+```
+
+
+# User Readme
+NPRI Reporting Guidance is available at [Environment Canada](https://www.canada.ca/en/environment-climate-change/services/national-pollutant-release-inventory/report/pfas.html) and summarized by OCWA Compliance at `//ocwfilecorp/Public/Everyone/PCT/CEPA/National Pollutant Release Inventory (NPRI)`
+  
+Each individual NPRI PFAS with a quantity (aggregate of biosolids and effluent components, as shown in first tab/table of each treatment category) ≥1 kg must be reported (denoted as reportable "TRUE").  Users may click the table field headers (e.g. "aggregate_kg" or "reportable") to sort results in order.    
+
+## Facility basis (effluent and biosolids quanitities)
+Calculated PFAS mass are based on annual total effluent flow and biosolids hauled, as recorded in WISKI.  
+
+The two values for the **`r params$facility`** in WISKI, as retrievable by standard Reporting Services template output, were **`r flag_completeness` and hence the PFAS calculations are `r flag_completeness`.**  
+
+The following values were extracted from WISKI for `r params$facility`:  
+
+- Effluent: `r effluent_L/1000` cubic meters
+- Hauled biosolids or sludge**^**: `r round(biosolid_kg,0)` dry kilograms
+
+**^** *where WISKI records were in units of cubic meters hauled, the dry kilograms was calculated by multiplying the annual average of the biosolids total solids results*  
+  
+Wastewater facilities with annual average discharge of < 10,000 m3 per day are exempt from reporting for NPRI.  
+
+Please contact IPOTS (Jane - jho@ocwa.com) if the value requires alteration.
+
+```{ojs, echo = FALSE, eval = FALSE}
+//| echo: false
+//| eval: false
+// Define a reactive variable 'plantDailyFlow'
+viewof plantDailyFlow = Inputs.number({
+  label: "Enter Annual Effluent Flow (m3/day)", 
+  value: 10000, 
+  step: 0.01
+})
+// Create the file input widget
+
+//## Site-specific sample results available
+//1. In the future, xml's from the lab will be uploaded directly into the calculator.  
+//These values will supersede their corresponding NPRI s in the NPRI report set.
+//If sample results are not available, then the NPRI s are used for basis of calculation.
+viewof uploadedFile = Inputs.file({
+  label: "CSV file", 
+  accept: ".csv", 
+  required: true
+})
+
+// This block reactively waits for a file and parses it
+dt_uploadedData = {
+  const raw = await uploadedFile.csv({ typed: true });
+  // Skip the first 3 rows
+  return raw.slice(3);
+}
+// Display the parsed data in an interactive table widget
+Inputs.table(dt_uploadedData)
+<!-- The uploaded file has **${dt_uploadedData.length}** rows.  -->
+```
+ <!-- **Automatic Recalculation:** The moment `uploadedFile` changes, everything else all update instantly in a chain. CHECK -->
+
+
+## Environment Canada NPRI default wastewater treatment categories  
+NPRI provides  values for wastewater, including PFAS not analyzed by EPA 1633A, based on three sets of treatment parameters.  All combinations of these default liquid & solid types have been pre-calculated and the closest matching to your facility should be selected using the table of content links to the right.
+
+I. Liquid Treatment Type
+- Primary treatment
+- Secondary treatment
+- Tertiary/advanced treatment
+
+II. Solids Treatment Type
+- Dewatering of solids
+- Alkaline 
+- Anaerobic digestion
+- Anaerobic digestion and pelletization
+  
+III. Residential source
+- more than 90%
+- between 70% to 90%
+- less than 70%
+
+
+# Primary Treatment
+
+## Primary Treatment, Greater than 90% res. source & dewatering of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% res. source & dewatering of solids
+
+type_eff = "primary_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "primary_treatment_with_dewatering_of_solids_gt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+    
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+    
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Primary Treatment, Greater than 90% res. source & alkaline solid treatment
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% res. source & alkaline solid treatment
+bio_mass$
+type_eff = "primary_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "primary_treatment_with_alkaline_solids_treatment_gt_90_pct_residential_sources_ng_g_dry_weight_basis_5"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Primary Treatment, Greater than 90% res. source & anaerobic digestion of solid
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% res. source & anaerobic digestion of solid
+type_eff = "primary_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "primary_treatment_with_anerobic_digestion_of_solids_gt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Primary Treatment, Less than 90% res. source
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Less than 90% res. source
+type_eff = "primary_treatment_with_lt_90_pct_residential_sources_kg"
+type_bio = "primary_treatment_with_dewatering_of_solids_lt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+:::
+
+# Secondary Treatment
+## Secondary Treatment, Less than 70% res. source with anaerobic digestion of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Less than 70% res. source with anaerobic digestion of solids
+type_eff = "secondary_treatment_with_lt_70_pct_residential_sources_kg"
+type_bio = "secondary_treatment_with_anerobic_digestion_of_solids_lt_70_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Secondary Treatment, Less than 70% res. source with anaerobic digestion & pelletization of solids
+
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Less than 70% residential with anaerobic digestion & pelletization of solids
+
+type_eff = "secondary_treatment_with_lt_70_pct_residential_sources_kg"
+type_bio = "secondary_treatment_with_anerobic_digestion_and_pelletization_of_solids_lt_70_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Secondary Treatment, 70%-90% residential with anaerobic digestion of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: 70%-90% residential with anaerobic digestion of solids
+type_eff = "secondary_treatment_with_70_pct_90_pct_residential_sources_kg"
+type_bio = "secondary_treatment_with_anerobic_digestion_of_solids_70_pct_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Secondary Treatment, Greater than 90% residential with anaerobic digestion of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% residential with anaerobic digestion of solids
+type_eff = "secondary_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "secondary_treatment_with_anerobic_digestion_of_solids_gt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+:::
+
+## Secondary Treatment, Greater than 90% residential with anaerobic digestion & dewatering of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% residential with anaerobic digestion & dewatering of solids
+type_eff = "secondary_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "secondary_treatment_with_dewatering_of_solids_gt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+:::
+# Tertiary
+## Tertiary, Less than 90% residential with dewatering of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Less than 90% residential with dewatering of solids
+type_eff = "tertiary_advanced_treatment_with_lt_90_pct_residential_sources_kg"
+type_bio = "tertiary_treatment_with_dewatering_of_solids_lt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+:::
+
+## Tertiary, Greater than 90% residential with dewatering of solids
+::: {.panel-tabset}
+## Total (Effluent and Biosolids)
+```{r}
+#| title: Greater than 90% residential with dewatering of solids
+
+type_eff = "tertiary_advanced_treatment_with_gt_90_pct_residential_sources_kg"
+type_bio = "tertiary_treatment_with_dewatering_of_solids_gt_90_pct_residential_sources_kg"
+
+rpt<-aggregate_and_report(type_eff = type_eff,type_bio = type_bio)
+
+rpt$agg_report%>%
+  gt() %>% 
+  tab_header(
+    title ="Total: ECCC-derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}<br>Biosolid Type: {type_bio}")) 
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$agg_report %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Effluent
+```{r}
+rpt$eff_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Effluent: ECCC -derived loads",
+    subtitle=md(glue("Effluent Type: {type_eff}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$eff_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+## Biosolids
+```{r}
+rpt$bio_subset %>% 
+  gt() %>% 
+  tab_header(
+    title ="Biosolids: ECCC -derived loads",
+    subtitle=md(glue("Biosolid Type: {type_bio}"))
+  ) %>% 
+  opt_interactive(
+    use_pagination = TRUE,
+    use_page_size_select = TRUE, 
+    page_size_default = 10
+  )
+
+rpt$bio_subset %>% 
+  download_this(
+    output_name = "npri_pfas_report",
+    output_extension = ".xlsx",
+    button_label = "Download as Excel",
+    button_type = "primary"
+  ) 
+```
+
+:::
