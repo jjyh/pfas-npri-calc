@@ -231,40 +231,6 @@ Wastewater facilities with annual average discharge of < 10,000 m3 per day are e
 
 Please contact IPOTS (Jane - jho@ocwa.com) if the value requires alteration.
 
-```{ojs, echo = FALSE, eval = FALSE}
-//| echo: false
-//| eval: false
-// Define a reactive variable 'plantDailyFlow'
-viewof plantDailyFlow = Inputs.number({
-  label: "Enter Annual Effluent Flow (m3/day)", 
-  value: 10000, 
-  step: 0.01
-})
-// Create the file input widget
-
-//## Site-specific sample results available
-//1. In the future, xml's from the lab will be uploaded directly into the calculator.  
-//These values will supersede their corresponding NPRI s in the NPRI report set.
-//If sample results are not available, then the NPRI s are used for basis of calculation.
-viewof uploadedFile = Inputs.file({
-  label: "CSV file", 
-  accept: ".csv", 
-  required: true
-})
-
-// This block reactively waits for a file and parses it
-dt_uploadedData = {
-  const raw = await uploadedFile.csv({ typed: true });
-  // Skip the first 3 rows
-  return raw.slice(3);
-}
-// Display the parsed data in an interactive table widget
-Inputs.table(dt_uploadedData)
-<!-- The uploaded file has **${dt_uploadedData.length}** rows.  -->
-```
- <!-- **Automatic Recalculation:** The moment `uploadedFile` changes, everything else all update instantly in a chain. CHECK -->
-
-
 ## Environment Canada NPRI default wastewater treatment categories  
 NPRI provides  values for wastewater, including PFAS not analyzed by EPA 1633A, based on three sets of treatment parameters.  All combinations of these default liquid & solid types have been pre-calculated and the closest matching to your facility should be selected using the table of content links to the right.
 
