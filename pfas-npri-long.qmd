@@ -8,6 +8,7 @@ format:
     toc: true
     toc-expand: 2
     number-sections: true
+    embed-resources: true
     code-fold: true
     other-links:
     - text: NPRI PFAS Guidance

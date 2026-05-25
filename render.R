@@ -1,6 +1,8 @@
 #run in RStudio Console source("render.R")
 library(quarto)
 library(tidyverse)
+library(janitor)
+library(readxl)
 
 dt_facilities <- read_excel(
   "data/PFAS-calculator.xlsx",
